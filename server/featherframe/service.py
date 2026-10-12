@@ -32,7 +32,7 @@ from urllib.parse import quote
 
 from PIL import Image
 
-from . import auth, drawn, firmware_release, hosted, spend
+from . import auth, drawn, firmware_release, hosted, spend, switching
 from . import plate_library, thumbs
 from . import frames as frames_mod
 from . import page_build, panels, paths
@@ -146,6 +146,18 @@ _NOVELTY_RANK = {"first-ever": 2, "first-today": 1, "repeat": 0}
 # How much of the day's tally / render log a novelty check reads. A busy
 # feeder is a few dozen species a day; the render log holds 200 rows.
 _TODAY_SCAN = 200
+# How far back the switch table lists the BirdNET-Go notes the server took
+# (W-1025): a push that repeats one is the same detection sent again.
+SWITCH_NOTES_S = 3600
+# How long a report waits for a tick in progress before it says no table
+# (W-1025). An empty table only wakes the server, which is always safe; a
+# report that blocked would hold up everything the front door is told. At a
+# stop the final report has about 15 s of the front door's grace left, once
+# `stop` has waited out the work under way, so it must fit in that.
+SWITCH_LOCK_WAIT_S = 10
+# What a seed from the phone's setup may set (W-888): the detection source and
+# the Region, and nothing else a body might carry.
+SEED_FIELDS = ("detection_backend", "birdweather_station_id", "region")
 
 
 def _as_time(v) -> dtime:
@@ -658,6 +670,10 @@ class FeatherframeService:
         self._fw_progress: dict = {}
         # Called after every tick, e.g. a hosted household's sync (W-844).
         self.after_tick: list = []
+        # The last queue seq whose effects, the frames' outputs included, are
+        # in this process (W-1025). A previous process applied everything the
+        # database holds; `apply_queue` moves it only when a take is done.
+        self._applied_seq = int(self.db.get("queue_seq", 0) or 0)
         self._tick_lock = threading.Lock()
         # Work under way (W-917): a tick, a task, a repaint, a firmware fetch,
         # each with when it began. A hosted Container is stopped only once
@@ -1535,19 +1551,28 @@ class FeatherframeService:
             return
         self._render_single(candidate, now, reason="detection")
 
+    def _fresh_spec(self, common: str, scientific: str, when: datetime,
+                    novelty: str, note: Optional[str], note_kind: Optional[str],
+                    fallback_note: Optional[str]) -> SingleSpec:
+        """The sheet a detection of this species draws. `_render_single` and
+        the switch table (W-1025) both build it here, so the table names the
+        sheet a real tick would show. The fallback note is the caller's: it
+        asks the spend gate, so the table reads it once, not per species."""
+        return SingleSpec(common_name=common, scientific_name=scientific, when=when,
+                          first_seen=self._first_seen(scientific), note=note,
+                          note_kind=note_kind, first_ever=novelty == "first-ever",
+                          fallback_note=fallback_note)
+
     def _render_single(self, det: Detection, now: datetime, reason: str) -> None:
         """Draw the plates picture of this detection. A detection whose sheet
         would be the one already shown is not drawn again (W-984): the sheet
         names the artist, never the time, so a repeat changes nothing."""
-        first_seen = self._first_seen(det.scientific_name)
         novelty = self._novelty(det, now)
         note = self._note_text()
-        spec = SingleSpec(common_name=det.common_name, scientific_name=det.scientific_name,
-                          when=det.timestamp if det.timestamp != datetime.min else now,
-                          first_seen=first_seen, note=note,
-                          note_kind=self._note_kind() if note else None,
-                          first_ever=novelty == "first-ever",
-                          fallback_note=self._fallback_note())
+        spec = self._fresh_spec(det.common_name, det.scientific_name,
+                                det.timestamp if det.timestamp != datetime.min else now,
+                                novelty, note, self._note_kind() if note else None,
+                                self._fallback_note())
         drawn_from = _drawn_from(spec)
         if reason == "detection" and self._is_shown(drawn_from):
             log.info("single %s: a repeat of the sheet shown, not drawn again", det.common_name)
@@ -1626,6 +1651,123 @@ class FeatherframeService:
                 (pic.meta.get("art") or not self._art_could_arrive()):
             names += [str(n) for n in pic.meta.get("names") or [] if n]
         return sorted(set(names))
+
+    def switch_table(self, now: Optional[datetime] = None) -> dict:
+        """What the front door may switch every screen to by itself when a
+        species is heard next (W-1025), or {} when it must wake this server.
+        Only a sheet already kept, drawn for every screen that would show it,
+        for a species not new today: anything else composes, buys or gates.
+        It never raises, and never waits long on a tick: an empty table only
+        wakes this server, so a report goes out without one rather than not at
+        all."""
+        try:
+            now = now or self._clock()
+            src = self.source
+            if (getattr(src, "kind", None) not in ("apprise", "birdnet_go")
+                    or self.in_quiet_hours(now) or PLATES not in self._kinds_shown(now)):
+                return {}
+            # Read as a tick reads, and never beside one: today's counts fresh,
+            # the pictures still. A report holds no tick lock, so it waits for
+            # one, but only so long: shutdown reports while a tick may still run.
+            if not self._tick_lock.acquire(timeout=SWITCH_LOCK_WAIT_S):
+                log.warning("switch table: a tick still runs after %ss; reporting none",
+                            SWITCH_LOCK_WAIT_S)
+                return {}
+            try:
+                before, self._tick_memo = self._tick_memo, {"now": now}
+                try:
+                    return self._switch_table(now, src)
+                finally:
+                    self._tick_memo = before      # a report leaves no memo behind
+            finally:
+                self._tick_lock.release()
+        except Exception:  # noqa: BLE001 — a table that fails must not cost the report
+            log.warning("switch table: not built; reporting none", exc_info=True)
+            return {}
+
+    def _switch_table(self, now: datetime, src) -> dict:
+        """The table itself, under the tick lock with a fresh memo (W-1025):
+        one entry for each species the push feed has heard whose sheet, and
+        every screen's finish of it, is already kept."""
+        # Detections this server holds that no tick has decided over (a page's
+        # start takes the queue and stops with no tick) are in the replay of
+        # the next marker, whatever the front door counts: a table now would let
+        # it choose over less than the server does (W-1025). None: a source new
+        # to this server, which the next tick starts at its tail.
+        cursor = self._cursor()
+        if cursor is None or self.source.new_since(cursor, CONFIDENCE_FLOOR, limit=1):
+            return {}
+        fallback = self._fallback_note()
+        kits = [r for r in self._kits_on()
+                if self._kind_for(frames_mod.shows_of(r), now) == PLATES]
+        viewers = [r for r in self.frames.by_transport(*viewers_mod.KINDS)
+                   if r.get("status") == frames_mod.ON
+                   and self._kind_for(viewers_mod.shows_of(r), now) == PLATES]
+        # A real switch composes the colour twin whenever `_commit` wants one,
+        # which a colour viewer's recent ask does even when none is on plates
+        # now; a viewer that is on plates is drawn a twin ahead by `ensure_view`.
+        color = self._color_wanted(PLATES, now) \
+            or any(self.frame_config(r).panel_spec.color for r in kits) \
+            or any(viewers_mod.view_of(r).fmt == "color" for r in viewers)
+        today = self._today_counts(now) or {}
+        species = {}
+        for common, scientific in src.heard():
+            key = scientific.strip().lower()
+            if not key or self.config.is_blocked(common, scientific) \
+                    or self._is_new_species(scientific, now.date()):
+                continue
+            det = Detection(rowid=0, date=now.strftime("%Y-%m-%d"), time=now.strftime("%H:%M:%S"),
+                            common_name=common, scientific_name=scientific, confidence=1.0)
+            # The tally takes a detection in before it is ranked (W-1025), so a
+            # species with none today ranks first-today and one with some, a repeat.
+            first_today = today.get(det.key, 0) == 0
+            spec = self._fresh_spec(common, scientific, now,
+                                    "first-today" if first_today else "repeat", None, None, fallback)
+            ref = self._art_ref(det)
+            if ref is None or (ref == "" and self._art_could_arrive()):
+                continue            # it would compose, or buy an illustration
+            kept = self._kept_sheet(drawn.sheet_key(_drawn_from(spec), ref))
+            if kept is None:
+                continue
+            etag = kept[0]
+            if color and not drawn.whole(drawn.twin_path(etag)):
+                continue            # a real switch would compose its colour twin
+            outs = {str(r["id"]): self._kept_output_for(r, PLATES, etag) for r in kits}
+            views = {str(r["id"]): self._kept_view_for(r, etag) for r in viewers}
+            if None in outs.values() or None in views.values():
+                continue            # some screen would have it drawn first
+            frames = {}
+            for fid, o in outs.items():
+                push = dict(self.push_message(fid) or {})
+                push["etag"] = o["etag"]
+                frames[fid] = {"etag": o["etag"], "file": o["file"], "push": push}
+            species[key] = {"common": common.strip().lower(), "first_today": first_today,
+                            "etag": etag, "frames": frames, "viewers": views}
+        with self._lock:
+            pic = self.pictures[PLATES]
+            shown_etag, meta = pic.etag, dict(pic.meta)
+        shown = str(meta.get("species_key") or "") or None
+        # The entry's sheet is what a fresh detection of the shown species
+        # would draw, so choosing it again changes nothing (W-1025), but only
+        # while the shown one is that sheet, whole: not waiting for colour, art
+        # present or none could arrive (`_is_shown`).
+        clean = (shown in species and species[shown]["etag"] == shown_etag
+                 and PLATES not in self._recolor
+                 and (bool(meta.get("art")) or not self._art_could_arrive()))
+        return {"valid_until": self._switch_valid_until(now), "shown": shown,
+                "shown_clean": clean,
+                "blocked": sorted({b.strip().lower() for b in self.config.species_blocklist if b.strip()}),
+                "floor": 0.0 if getattr(src, "_defer_confidence", False) else CONFIDENCE_FLOOR,
+                "notes": src.notes_since(SWITCH_NOTES_S, now),
+                "species": species}
+
+    def _switch_valid_until(self, now: datetime) -> int:
+        """The sooner of the next midnight (novelty and a dated sheet's key
+        turn over) and the next start of quiet hours, as an epoch (W-1025)."""
+        ends = [datetime.combine(now.date() + timedelta(days=1), dtime.min)]
+        if self.config.quiet_hours_mode != "off":
+            ends.append(self._next_time(now, self.quiet_window(now.date())[0]))
+        return int(min(ends).timestamp())
 
     # -- the collage picture -----------------------------------------------
     def _maybe_daytime_collage(self, now: datetime) -> None:
@@ -2689,6 +2831,24 @@ class FeatherframeService:
             return None
         return framebuffer.etag_for(data) if framebuffer.is_complete(data) else None
 
+    def _kept_output_for(self, row: dict, kind: str, etag: str) -> Optional[dict]:
+        """{"etag", "file", "src"} of this frame's output of picture `etag`
+        when it is already drawn under the current Refresh, else None. Names,
+        never draws: the lookup `_draw_frame` makes first, through the same
+        helpers, for the switch table (W-1025)."""
+        cfg = self.frame_config(row)
+        source = next(iter(pictures_mod.sheets_for(etag, cfg.panel_spec.color)), None)
+        if source is None:
+            return None
+        src = self._src_of(kind, etag, source, cfg)
+        key = drawn.okey(src)
+        fff, png = drawn.out_paths(etag, key)
+        rec = (self._drawn.get("outs") or {}).get(key) or {}
+        if rec.get("f") != self._drawn_token(etag):
+            return None
+        out = self._kept_output(fff, png, rec)
+        return None if out is None else {"etag": out, "file": drawn.rel(fff), "src": src}
+
     def _queued_seconds(self, row: dict, now: datetime) -> Optional[int]:
         """How long a frame on push will hold a change it has been told of:
         a full-refresh panel paints at most once per `min_repaint_s`, counted
@@ -2774,10 +2934,107 @@ class FeatherframeService:
         future = [w for w in when if w > now]
         return min(future).isoformat(timespec="seconds") if future else None
 
+    def apply_queue(self, rows: list) -> int:
+        """The front door's queue, in order (W-1025): each detection to the push
+        feed, a seed as the settings save it is, and each of the front door's
+        own switches as a plates tick at its time. A row at or below the last
+        seq applied was applied before a stop that lost its acknowledgement.
+        Returns the highest seq seen. It holds the tick lock, so nothing here
+        may ask for a report (`hosted_state` waits for the same lock). The last
+        seq is read under it: a start's take and a run's take are given the
+        same rows, and the second must see what the first applied."""
+        marked = False
+        with self._working(), self._tick_lock:
+            last = int(self.db.get("queue_seq", 0) or 0)
+            top = last
+            for row in sorted(rows, key=lambda r: int(r.get("seq") or 0)):
+                seq = int(row.get("seq") or 0)
+                top = max(top, seq)
+                if seq <= last:
+                    continue
+                path, body = str(row.get("path") or ""), str(row.get("body") or "")
+                try:
+                    payload = json.loads(body) if body else {}
+                except ValueError:
+                    payload = {}
+                try:
+                    if path == "marker":
+                        marked = True
+                        self._replay_marker(payload if isinstance(payload, dict) else {})
+                    elif path == "/api/hosted/seed":
+                        self.apply_seed(payload)
+                    elif path.startswith("/api/ingest/"):
+                        # Only the kind of push the source takes: the route
+                        # refused another with a 409, and one queued before the
+                        # household changed its source is still in the queue
+                        # (W-1025). The front door drops it from its choice too.
+                        ingest = getattr(self.source, "ingest", None)
+                        if callable(ingest) and switching.kind_of(path) == getattr(self.source, "kind", None):
+                            ingest(payload)
+                except Exception:  # noqa: BLE001 — one bad row must not wedge the queue behind it
+                    log.warning("queued row %s (%s) not applied", seq, path, exc_info=True)
+                    if path == "marker":
+                        # The front door switched the screens and this server
+                        # could not say whether it would have (W-1025): counted
+                        # with the ones it disagreed with.
+                        self._count_mismatch()
+                self.db.set("queue_seq", seq)
+            if marked:
+                # A switch the front door made is a picture here, but a frame's
+                # output follows it only in a tick; a report before one would
+                # put the frames back on the old picture (W-1025). Each output
+                # is already drawn, so this finds them and points the frames.
+                try:
+                    self._tick_frames()
+                except Exception:  # noqa: BLE001 — the queue is applied; a frame is drawn by the next tick
+                    log.warning("frames not drawn after the queue", exc_info=True)
+            self._applied_seq = top
+        return top
+
+    def _replay_marker(self, marker: dict) -> None:
+        """One of the front door's switches, as the tick it stands for, at its
+        own time: the source's alarms as `_tick_pictures` reads them, then the
+        plates picture. Its choice is checked; ours stands (W-1025)."""
+        try:
+            at = datetime.fromisoformat(str(marker.get("at")))
+            if at.tzinfo is not None:      # this server keeps local time
+                at = at.astimezone().replace(tzinfo=None)
+        except (TypeError, ValueError):
+            at = self._clock()
+        available = self.source.available()
+        self._track_source(at, available)
+        self._quiet = self.quiet_state(at, available=available)
+        self._outage = self.outage_state(at)
+        before = self.pictures[PLATES].etag
+        self._single_tick(at)
+        pic = self.pictures[PLATES]
+        want = str(marker.get("choice") or "")
+        shown = str(pic.meta.get("species_key") or "")
+        agrees = (pic.etag == before) if want == "same" else (shown == want)
+        if agrees and marker.get("etag"):
+            agrees = pic.etag == str(marker["etag"])
+        if not agrees:
+            log.warning("front door chose %s at %s; this server shows %s", want, at, shown or "nothing")
+            self._count_mismatch()
+
+    def _count_mismatch(self) -> None:
+        self.db.set("switch_mismatches", int(self.db.get("switch_mismatches", 0) or 0) + 1)
+
+    def apply_seed(self, body: dict) -> None:
+        """A household set up from the phone (W-888): its source and Region,
+        as a settings save of those fields, so a repeat changes nothing."""
+        if not isinstance(body, dict):
+            return
+        cur = self.config.to_dict()
+        cur.update({k: str(body[k]) for k in SEED_FIELDS if isinstance(body.get(k), str)})
+        self.update_config(Config.from_dict(cur).sanitize())
+
     def hosted_state(self) -> dict:
         """What the front door needs to answer every kit without this server:
         each one's status, its output (the file and its ETag), the headers that
         ride on /api/frame, and its push message."""
+        # Read first: the outputs below are at least as new as this (W-1025).
+        applied = self._applied_seq
         out = {}
         for row in self.frames.by_transport("kit"):
             fid = str(row["id"])
@@ -2822,6 +3079,16 @@ class FeatherframeService:
                 # Which detections would change nothing (W-984): kept for the
                 # next wake without one of their own.
                 "unchanged": self.news_unchanged(),
+                # What the front door may switch every screen to without waking
+                # this server (W-1025).
+                "switches": self.switch_table(),
+                # How often a switch the front door made differed from what this
+                # server then chose (W-1025): the admin page shows it.
+                "switch_mismatches": int(self.db.get("switch_mismatches", 0) or 0),
+                # The last queue seq whose effects, the frames included, this
+                # report shows (W-1025): the front door keeps the screens it
+                # switched itself while any of its markers is past it.
+                "applied_seq": applied,
                 # Where news comes from (W-847): the front door looks for it
                 # itself — it polls a BirdWeather station, or takes the pushes
                 # (Apprise from BirdNET-Pi, a webhook from BirdNET-Go) — and
@@ -3699,6 +3966,18 @@ class FeatherframeService:
         rec = (self._drawn.get("views") or {}).get(name) or {}
         return (rec.get("f") or "") == self._drawn_token(etag) and drawn.exists(drawn.view_path(name))
 
+    def _kept_view_for(self, row: dict, etag: str) -> Optional[dict]:
+        """{"name", "file"} of this viewer's view of picture `etag`, already
+        drawn, else None (W-1025)."""
+        view = viewers_mod.view_of(row)
+        source = next(iter(pictures_mod.sheets_for(etag, view.fmt == "color")), None)
+        if source is None:
+            return None
+        name = drawn.view_name(source, view.key)
+        if not self._view_kept(etag, name):
+            return None
+        return {"name": name, "file": drawn.rel(drawn.view_path(name))}
+
     def _draw_view(self, etag: str, source: Path, view: "pipeline.View",
                    name: str) -> Optional[bytes]:
         """Draw one view of a sheet into the drawn store; its bytes, or None
@@ -3936,7 +4215,7 @@ class FeatherframeService:
                        by_novelty: bool) -> Optional[Detection]:
         pending: Optional[dict] = None
         chosen: Optional[Detection] = None
-        best = -1
+        ranked: list = []
         for d in detections:
             if self.config.is_blocked(d.common_name, d.scientific_name):
                 continue
@@ -3949,10 +4228,12 @@ class FeatherframeService:
                 chosen = d
                 break
             rank = _NOVELTY_RANK[self._novelty(d, now)]
-            if rank > best:           # strictly: newest wins within a class
-                chosen, best = d, rank
-            if best == max(_NOVELTY_RANK.values()):
+            ranked.append((rank, d))
+            if rank == max(_NOVELTY_RANK.values()):
                 break                 # nothing older can outrank a first-ever
+        if by_novelty:
+            # One order for the server and the front door's port (W-1025).
+            chosen = switching.best(ranked)
         if pending is not None:
             self._set_pending(pending)
         return chosen

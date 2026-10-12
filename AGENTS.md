@@ -628,13 +628,14 @@ and `/fonts/script.ttf` are bundled into the Worker (`rules` in
 wrangler.jsonc): opening the page wakes nothing.
 Per household, `Household` (`household.ts`) is the front door: it answers
 `/api/frame` from its table + R2, holds push sockets, keeps check-ins and
-detectors' pushes (routed by token; a BirdNET-Go body that is not a
-detection is dropped) until the server takes them, and wakes the
-server only for news (a BirdWeather look every 2 min, a push, the server's
-own `next_wake_epoch`; ≥ 5 min apart; none in quiet hours; none for a
-detection the server named in `hosted_state()["unchanged"]`, W-984: the
-species whose sheet is shown and the blocked ones, or `"*"` while no frame
-shows detections, read from a push by `util.pushedNames`), stopping it right
+detectors' pushes (routed by token; a BirdNET-Go body that is not a detection
+is dropped) in its `ingest` queue until the server takes them (below), and
+wakes the server only for news (a BirdWeather look every 2 min, a push it
+cannot answer itself, the server's own `next_wake_epoch`; ≥ 5 min apart; none
+in quiet hours; none for a detection the server named in
+`hosted_state()["unchanged"]`, W-984: the species whose sheet is shown and the
+blocked ones, or `"*"` while no frame shows detections, read from a push by
+`util.pushedNames`), stopping it right
 after — but only once it is idle (W-917): the Containers library's activity
 timeout (`sleepAfter`, 30 s) runs from a request's start and knows nothing of
 the server's own work, so `HouseholdServer.onActivityExpired` and `wake()`
@@ -647,6 +648,50 @@ per-key failure cooldown is kept in the DB (`imagegen_cooldowns`, cleared
 with `imagegen_error` on a new key), so a fresh Container does not ask a
 failed paid generation again early.
 
+A push that only points the frames at a picture already drawn does not start
+the server (W-1025). A pushed detection sets `push_news`, apart from `news`,
+which pairing and a BirdWeather look keep; when detections are the only reason
+a wake is due (`wakes.onlyDetections`) and the server is not running,
+`decideAlone` runs `choose` over the detections it has not yet taken. Every
+report carries `switches`, the switch table (`service.switch_table`): for each
+species with a kept sheet drawn for every screen on plates, and not new today,
+what each frame and viewer would be switched to, with a `valid_until` (the
+sooner of midnight and the next quiet hours) after which nothing is decided;
+`{}` whenever the front door must not decide (not a push source, quiet hours,
+no frame on plates, or detections the server holds that no tick has decided
+over: a page's start takes the queue and stops with no tick, and the replay of
+the next marker would choose over them), and an older image reports none. It also carries
+`applied_seq` and `switch_mismatches`, the server's running count of markers it
+disagreed with, which the admin page shows. The rule is pure:
+`featherframe/switching.py` (`parse`, `best`, which the server's own
+`_pick_showable` ranks with, and `choose`) is ported to `hosted/src/switch.ts`,
+both held to `server/tests/fixtures/switch-cases.json` as `spend.decide` is to
+`spend-cases.json`. `server/tests/test_switch_e2e.py` holds the two halves
+together: a Python `FrontDoor` (`decideAlone`, the queue routes and `takeState`'s
+rule) drives a real service through scripted batches with page starts between,
+and the server's replay must agree. When `decideAlone` or `takeState` changes,
+so does that class. On a species it writes the frame and viewer rows, tells the
+sockets last, sets `unchanged`, counts the switch (`usage.switches`) and ages the
+page's copies (`PageCache.age`: dated back and kept, since `clear()` leaves
+nothing to serve and the next poll starts the server); on that or `same` (what
+the frames already show) it writes a `marker` row into the queue after the
+detections it decided over. A species with no entry (one the server has not
+drawn, or new today), a push with no scientific name (the server would draw
+another sheet than any entry names), a first-seen date of today, a seed row in
+the queue, a row the server took and has not acknowledged (it counts that row
+and `decideAlone` would not), an expired table or an error is a wake, as
+before. A push of the other detector's kind than the household's `source_kind`
+(queued before it changed its source) is dropped from the choice, and
+`apply_queue` skips it, as the route's 409 did. The five-minute
+gap for detections counts from the later of `wake_ms` (the server's last wake,
+which the daily wake and the admin page read) and `switch_ms`. `nextAlarm`
+alarms for a named time whenever there is one, even one that came due while
+`decideAlone` awaited the server; one a wake has since failed to move is
+retried after `MIN_GAP_MS`, not every second. `takeState`
+keeps the rows the front door switched, and its table, while a marker is past
+the report's `applied_seq` (the report is older than the switch), and asks for
+a wake.
+
 The webapp's reads come from a cache at the front door (W-946,
 `hosted/src/pagecache.ts`): the server's last answer to `/`, `/api/status`,
 `/api/history`, `/api/tasks`, the battery, the previews, the history and
@@ -655,7 +700,8 @@ generated images and `/static/*`, kept in R2 and keyed by the server's
 still served while a `look` asks the alarm for a wake (`wakes.ts`, never
 before `MIN_GAP_MS`, in quiet hours only when something is queued). The
 server's reports (`takeState`) refresh the copies read in the last 2 h when
-the page would change or after a POST; a POST clears the changing ones; `/`
+the page would change or after a POST; a POST clears the changing ones (the
+front door's own switch only ages them, W-1025); `/`
 with nothing kept and the server asleep is the bundled loading page
 (`loading.ts`). Reads that must be live ask `live=1`; every other read the
 page makes as it loads must be in `routeOf`'s table, or each visit starts the
@@ -677,7 +723,8 @@ image rolls forward only: an older image would not see the front door's
 records.
 
 `HouseholdServer` is THIS Python server in a Container: there is no TS copy of
-any rule but the spend gate's `decide`, above, held to the same cases. Hosted
+any rule but the spend gate's `decide` and the front door's switch rule
+`choose` (W-1025, above), each held to its Python side's cases. Hosted
 mode (`featherframe/hosted.py`, on with
 `FEATHERFRAME_HOSTED_URL`/`_KEY`) pulls the data dir from
 `/_internal/<household>/` before the DB opens, pushes changes after every
@@ -685,11 +732,33 @@ tick and POST, applies check-ins through `app.parse_checkin` →
 `service.apply_checkin` (`add` = paired), and reports `hosted_state()`; a wake
 is `POST /api/hosted/run`, its one tick and its one sync (W-985: a hosted
 server never ticks on its own clock, `service.ticks_itself`, and the run
-request does not sync again after its tick). The small files a start reads
-travel as archives, `bundles/files.tar` and `bundles/history.tar`
-(`hosted.bundle_of`): one request each, not one per file; what the front
-door serves itself, the pictures, the DB and anything over 256 KB stay files
-of their own, and an archive wins over a file of the same path. A start
+request does not sync again after its tick). The server takes the front door's
+queue itself (W-1025); the front door sends it nothing at a wake.
+`POST {base}/ingest/take` returns every queued row with its `seq`, and
+`ingest/ack {upto}` deletes them only after the settle that carried the
+database holding them to R2. It is taken at start, beside the server on a
+thread (the container library gives a start 20 s to answer on its port) and at
+the top of every `/api/hosted/run`. A report waits for the start's take, up to
+`QUEUE_WAIT_S` (`HostedLink.queue_ready` is set even when the take fails), and
+carries `applied_seq`, so the front door can tell a report that is behind a
+switch it made (`takeState`, above). `service.apply_queue` applies pushes,
+seeds and markers in `seq` order under the tick lock, skipping any at or below
+`queue_seq` (a take repeated after a crash applies nothing twice); a marker is
+the plates part of a tick at its own time (`_replay_marker`), so History, the
+cursor and the counts come out as if the server had been awake, and its choice
+is checked against the server's own: a disagreement, or a replay that raises,
+is counted in `switch_mismatches` and the server's picture stands. The take
+applies the check-ins and the queue each on its own, so one failing costs the
+other nothing, and `settle` builds its state and sends it under
+`HostedLink._report_lock`, so two reports reach the front door in the order
+their states were built (not `_lock`: building the state asks for the tick
+lock, which a tick holds while it asks for `_lock`). `applied_seq` is read
+before the report's outputs, so they are at least as new as it says. The small
+files a start reads travel as archives, `bundles/files.tar` and
+`bundles/history.tar` (`hosted.bundle_of`): one request each, not one per file;
+what the front door serves itself, the pictures, the DB and anything over
+256 KB stay files of their own, and an archive wins over a file of the same
+path. A start
 writes every file fresh, so nothing may order files by their times (W-1009):
 history keeps what the render log shows last, waiting plates the last drawn
 (kv `waiting_views`), and whatever replaces an image drops its thumbnail. The image
@@ -698,19 +767,23 @@ Stucki kernel's numba cache (`NUMBA_CPU_NAME=generic`, so it holds on any
 x86-64 host), Python's library and the server as bytecode, the page's
 templates into `FEATHERFRAME_TEMPLATE_CACHE` (Jinja loads with the first page,
 `app.page_templates()`, so a wake never imports it), and one BLAS thread;
-`tests/test_start_cost.py` holds them. Admin: `/admin` (W-850, `admin.ts`) for a
-signed-in user whose email is in the `ADMIN_EMAILS` secret, 404 to anyone
-else — the waitlist (D1 `waitlist`: the marketing page's form posts
-`POST /api/waitlist`, form or JSON with CORS for the apex; double opt-in:
-an address is pending until it follows the emailed link,
-`GET /api/waitlist/confirm?t=` (token hashed, 7 days, re-sent at most every
-10 min, `signUpWaitlist`), with the same answer for every address and 5
+`tests/test_start_cost.py` holds them. The container library's readiness check,
+`GET http://ping/`, is answered with a 204 before any route
+(`app._ReadinessPing`, W-1024), so a wake never builds the page to say it is
+up. Admin: `/admin` (W-850, `admin.ts`) for a signed-in user whose email is in
+the `ADMIN_EMAILS` secret, 404 to anyone else — the waitlist (D1 `waitlist`:
+the marketing page's form posts `POST /api/waitlist`, form or JSON with CORS
+for the apex; double opt-in: an address is pending until it follows the emailed
+link, `GET /api/waitlist/confirm?t=` (token hashed, 7 days, re-sent at most
+every 10 min, `signUpWaitlist`), with the same answer for every address and 5
 sign-ups an hour per IP and per address (D1 `rate_hits`); an uninvited email
 trying to sign in joins it pending, and is not emailed; the admin counts only
 confirmed ones), invitations, and every household
 (frames and when each was last seen, from the front door's `summary()`, and
 rough server time by UTC day: its wakes, apart from the time a page kept it
-up, W-907).
+up, W-907; and the last 7 days' switches the front door made without a wake,
+summed from the same `usage` days, with a running count of the ones the server
+disagreed with, W-1025).
 W-860 added this month's Cloudflare usage against the Workers Paid allowances
 and the bill so far (`usage.ts`: GraphQL Analytics with the `CF_API_TOKEN`
 secret, one query per dataset so a missing field costs one meter; Containers

@@ -4,6 +4,7 @@ door here is a fake with the same internal API, in memory."""
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -25,6 +26,9 @@ def front_door():
     """The household's front door, as far as this server can tell."""
     door = Door()
     door.state.files, door.state.states, door.state.queue, door.state.calls = {}, [], [], []
+    # What the front door keeps of detections, seeds and its own switches
+    # (W-1025): rows {seq, path, body}, and the seqs the server acknowledged.
+    door.state.ingest, door.state.acked = [], []
 
     def ok(request):
         return request.headers.get("authorization") == "Bearer k"
@@ -57,6 +61,18 @@ def front_door():
     async def take():
         q, door.state.queue = door.state.queue, []
         return {"checkins": q}
+
+    @door.post("/h/ingest/take")
+    async def ingest_take(request: Request):
+        assert ok(request)
+        return {"rows": list(door.state.ingest)}
+
+    @door.post("/h/ingest/ack")
+    async def ingest_ack(request: Request):
+        upto = (await request.json())["upto"]
+        door.state.acked.append(upto)
+        door.state.ingest = [r for r in door.state.ingest if r["seq"] > upto]
+        return {"ok": True}
 
     return door
 
@@ -850,3 +866,462 @@ def test_the_cpu_report_says_what_it_can_and_never_raises(monkeypatch):
     assert "proc_cpu=" in line and "ncpu=" in line
     monkeypatch.setattr(hosted, "_read", lambda path: "garbage")
     assert "proc_cpu=" in hosted.vm_report(first=True)
+
+
+# -- the queue, taken by the server (W-1025) --------------------------------------
+def _go(common, sci, note=None):
+    return json.dumps({"type": "detection", "metadata": {
+        "species": common, "scientific_name": sci, "confidence": 0.9, "note_id": note,
+        "bg_detection_date": NOW.strftime("%Y-%m-%d"), "bg_detection_time": NOW.strftime("%H:%M:%S")}})
+
+
+def _queue_svc(env):
+    from featherframe.sources.pushed import PushedSource
+    door, link, data = env
+    svc = _service()
+    svc.config.detection_backend = "birdnet_go"
+    svc.source = PushedSource("birdnet_go", svc.db)
+    tok = svc.config.ingest_token
+    return door, link, svc, tok
+
+
+def test_the_server_takes_pushes_and_acknowledges_them_after_they_reach_the_front_door(env):
+    door, link, svc, tok = _queue_svc(env)
+    door.state.ingest = [{"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+    link.take(svc)
+    assert [d.common_name for d in svc.source.new_since(0)] == ["Blue Jay"]
+    assert door.state.acked == []               # not until the database is in R2
+    link.settle(svc, False)
+    assert door.state.acked == [1] and door.state.ingest == []
+
+
+def test_a_queue_taken_twice_is_applied_once(env):
+    door, link, svc, tok = _queue_svc(env)
+    door.state.ingest = [{"seq": 4, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+    link.take(svc)
+    link.take(svc)                              # a start stopped before its ack, then started again
+    assert len(svc.source.new_since(0)) == 1
+    assert svc.db.get("queue_seq") == 4
+
+
+def test_a_marker_is_a_plates_tick_at_its_own_time(env):
+    door, link, svc, tok = _queue_svc(env)
+    svc.tick()
+    at = NOW - timedelta(minutes=30)
+    door.state.ingest = [
+        {"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 2, "path": "marker", "body": json.dumps({"at": at.isoformat(), "choice": "cyanocitta cristata",
+                                                         "etag": None, "upto": 1})}]
+    link.take(svc)
+    assert svc.pictures["plates"].meta.get("label") == "Blue Jay"
+    assert svc.render_history()[0]["rendered_at"].startswith(at.isoformat()[:16])
+
+
+def test_a_marker_the_server_disagrees_with_is_counted_and_its_own_choice_stands(env):
+    door, link, svc, tok = _queue_svc(env)
+    svc.tick()
+    door.state.ingest = [
+        {"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 2, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "cardinalis cardinalis",
+                                                         "etag": None, "upto": 1})}]
+    link.take(svc)
+    assert svc.pictures["plates"].meta.get("label") == "Blue Jay"
+    assert svc.hosted_state()["switch_mismatches"] == 1
+
+
+def test_a_seed_in_the_queue_is_applied_like_the_route(env):
+    door, link, svc, tok = _queue_svc(env)
+    door.state.ingest = [{"seq": 1, "path": "/api/hosted/seed", "body": json.dumps({"region": "europe"})}]
+    link.take(svc)
+    from featherframe.config import load_config
+    assert load_config(svc.db).region == "europe"     # this test's service does not reload
+
+
+def test_a_push_of_the_other_detectors_kind_is_not_applied(env):
+    """A push queued before the household changed its source: the route refused
+    it with a 409, and the front door drops it from its choice (W-1025). The
+    body here is one either parser would read, so only the path decides."""
+    from featherframe.sources.pushed import PushedSource
+    door, link, svc, tok = _queue_svc(env)
+    both = json.dumps({"type": "detection", "comname": "Blue Jay", "sciname": "Cyanocitta cristata",
+                       "confidence": 0.9, "date": NOW.strftime("%Y-%m-%d"), "time": NOW.strftime("%H:%M:%S"),
+                       "metadata": {"species": "Blue Jay", "scientific_name": "Cyanocitta cristata",
+                                    "confidence": 0.9}})
+    door.state.ingest = [{"seq": 1, "path": f"/api/ingest/apprise/{tok}", "body": both},
+                         {"seq": 2, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Northern Cardinal", "Cardinalis cardinalis")}]
+    link.take(svc)
+    assert [d.common_name for d in svc.source.new_since(0)] == ["Northern Cardinal"]
+    assert svc.db.get("queue_seq") == 2 and link._ack_upto == 2        # applied: acknowledged all the same
+    # And the other way round.
+    svc.source = PushedSource("apprise", svc.db)
+    door.state.ingest = [{"seq": 3, "path": f"/api/ingest/birdnet-go/{tok}", "body": both},
+                         {"seq": 4, "path": f"/api/ingest/apprise/{tok}", "body": both}]
+    link.take(svc)
+    assert [d.common_name for d in svc.source.new_since(0)] == ["Blue Jay"]
+
+
+def test_a_take_of_check_ins_that_fails_does_not_skip_the_queue(env, monkeypatch, caplog):
+    """W-1025: each is taken on its own, and the take is over either way."""
+    import logging
+    door, link, svc, tok = _queue_svc(env)
+    door.state.ingest = [{"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+
+    def down():
+        raise hosted.requests.ConnectionError("no check-ins today")
+
+    monkeypatch.setattr(link, "take_checkins", down)
+    link.queue_ready.clear()
+    with caplog.at_level(logging.WARNING, logger="featherframe.hosted"):
+        link.take(svc)
+    assert [d.common_name for d in svc.source.new_since(0)] == ["Blue Jay"]
+    assert link.queue_ready.is_set() and link._ack_upto == 1
+    assert any("check-ins" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_a_queue_that_cannot_be_taken_does_not_skip_the_check_ins(env, monkeypatch, caplog):
+    import logging
+    door, link, svc, tok = _queue_svc(env)
+    door.state.queue = [{"id": "aa:bb:cc:00:00:01", "add": True, "at": "2026-09-22T11:59:00",
+                         "viewer": {"transport": "trmnl", "headers": {"Model": "x", "Width": "1872", "Height": "1404"}}}]
+
+    def down():
+        raise hosted.requests.ConnectionError("no queue today")
+
+    monkeypatch.setattr(link, "take_queue", down)
+    link.queue_ready.clear()
+    with caplog.at_level(logging.WARNING, logger="featherframe.hosted"):
+        link.take(svc)
+    assert svc.frames.get("AA:BB:CC:00:00:01")["status"] == frames_mod.ON
+    assert link.queue_ready.is_set() and link._ack_upto == 0
+    assert any("queue" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_reports_reach_the_front_door_in_the_order_their_states_were_built(env, monkeypatch):
+    """A save's settle that built its state before a run's tick must not report
+    after the run's own: the front door would keep the older frames with the
+    newer table (W-1025)."""
+    import itertools
+    import threading
+    door, link, svc, tok = _queue_svc(env)
+    built, real = itertools.count(1), svc.hosted_state
+    first_built, release = threading.Event(), threading.Event()
+
+    def state():
+        out = {**real(), "n": next(built)}
+        if out["n"] == 1:
+            first_built.set()
+            assert release.wait(10)               # slow between its build and its report
+        return out
+
+    monkeypatch.setattr(svc, "hosted_state", state)
+    save = threading.Thread(target=link.settle, args=(svc, False))
+    save.start()
+    assert first_built.wait(10)
+    run = threading.Thread(target=link.settle, args=(svc, False))
+    run.start()
+    run.join(0.3)                                 # it has to wait: its state would be built after the first's
+    release.set()
+    save.join(10)
+    run.join(10)
+    assert [s["n"] for s in door.state.states] == [1, 2]
+
+
+def test_a_report_builds_its_state_holding_no_lock_a_tick_needs(env, monkeypatch):
+    """The state asks for the tick lock, and a tick holds that while it reads
+    through `hosted.fetch` and `glob`, which take the link's `_lock`: the
+    ordering of reports cannot be that lock (W-1025)."""
+    import threading
+    door, link, svc, tok = _queue_svc(env)
+    real, free = svc.hosted_state, []
+
+    def state():
+        got = []
+        t = threading.Thread(target=lambda: got.append(link._lock.acquire(timeout=2)) or link._lock.release())
+        t.start()
+        t.join(5)
+        free.append(bool(got and got[0]))
+        return real()
+
+    monkeypatch.setattr(svc, "hosted_state", state)
+    link.settle(svc, False)
+    assert free == [True]
+
+
+def test_a_report_waits_for_the_starts_take(env, monkeypatch):
+    import threading
+    door, link, svc, tok = _queue_svc(env)
+    link.queue_ready.clear()
+    reported = []
+    monkeypatch.setattr(link, "report", lambda state: reported.append(1))
+    t = threading.Thread(target=link.settle, args=(svc, False))
+    t.start()
+    t.join(0.2)
+    assert reported == []                       # still waiting on the take
+    link.queue_ready.set()
+    t.join(5)
+    assert reported == [1]
+
+
+def test_a_marker_that_keeps_the_sheet_agrees_only_with_its_etag(env):
+    door, link, svc, tok = _queue_svc(env)
+    svc.tick()
+    door.state.ingest = [
+        {"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 2, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "cyanocitta cristata",
+                                                         "etag": None, "upto": 1})}]
+    link.take(svc)
+    etag = svc.pictures["plates"].etag
+    door.state.ingest = [
+        {"seq": 3, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "same",
+                                                         "etag": etag, "upto": 2})}]
+    link.take(svc)
+    assert svc.hosted_state()["switch_mismatches"] == 0
+    door.state.ingest = [
+        {"seq": 4, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "same",
+                                                         "etag": "0123456789abcdef", "upto": 2})}]
+    link.take(svc)
+    assert svc.hosted_state()["switch_mismatches"] == 1
+
+
+def test_a_marker_may_carry_its_time_with_an_offset(env):
+    door, link, svc, tok = _queue_svc(env)
+    svc.tick()
+    at = (NOW - timedelta(minutes=30)).astimezone()
+    door.state.ingest = [
+        {"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 2, "path": "marker", "body": json.dumps({"at": at.isoformat(), "choice": "cyanocitta cristata",
+                                                         "etag": None, "upto": 1})}]
+    link.take(svc)
+    assert svc.render_history()[0]["rendered_at"].startswith((NOW - timedelta(minutes=30)).isoformat()[:16])
+
+
+def test_a_front_door_that_cannot_hand_over_its_queue_costs_nothing(env, monkeypatch):
+    """The Worker deploys before the image rolls out, and a server from before
+    the queue met a front door with the route is the other way round: a 404 is
+    nothing taken, and reports may go."""
+    door, link, svc, tok = _queue_svc(env)
+
+    def missing():
+        raise hosted.requests.HTTPError("404 Not Found")
+
+    monkeypatch.setattr(link, "take_queue", missing)
+    link.queue_ready.clear()
+    link.take(svc)                                    # logged, not raised
+    assert link.queue_ready.is_set() and door.state.acked == []
+    link.settle(svc, False)
+    assert door.state.states and door.state.acked == []
+
+
+def test_a_queue_is_acknowledged_only_once_a_report_has_got_through(env, monkeypatch):
+    door, link, svc, tok = _queue_svc(env)
+    door.state.ingest = [{"seq": 7, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+    link.take(svc)
+    report, down = link.report, [True]
+
+    def flaky(state):
+        if down[0]:
+            raise hosted.requests.ConnectionError("down")
+        report(state)
+
+    monkeypatch.setattr(link, "report", flaky)
+    link.settle(svc, False)
+    assert door.state.acked == [] and len(door.state.ingest) == 1     # still the front door's
+    down[0] = False
+    link.settle(svc, False)
+    assert door.state.acked == [7] and door.state.ingest == []
+    link.settle(svc, False)
+    assert door.state.acked == [7]                                   # once
+
+
+def test_a_row_that_cannot_be_applied_does_not_stop_the_rows_behind_it(env, monkeypatch):
+    door, link, svc, tok = _queue_svc(env)
+
+    def broken(marker):
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(svc, "_replay_marker", broken)
+    door.state.ingest = [
+        {"seq": 1, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "same", "etag": None, "upto": 0})},
+        {"seq": 2, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+    link.take(svc)
+    assert [d.common_name for d in svc.source.new_since(0)] == ["Blue Jay"]
+    assert svc.db.get("queue_seq") == 2 and link._ack_upto == 2
+    # A marker whose replay fails is a switch the server could not check:
+    # counted with the ones it disagreed with (W-1025). A push that fails is not.
+    assert svc.hosted_state()["switch_mismatches"] == 1
+
+
+def test_taking_the_queue_is_work_under_way_and_holds_the_tick_lock(env, monkeypatch):
+    door, link, svc, tok = _queue_svc(env)
+    seen = []
+    monkeypatch.setattr(svc.source, "ingest", lambda payload: seen.append((svc.busy_for() is not None,
+                                                                          svc._tick_lock.locked())))
+    door.state.ingest = [{"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+    link.take(svc)
+    assert seen == [(True, True)] and svc.busy_for() is None and not svc._tick_lock.locked()
+
+
+def test_a_start_takes_the_queue_before_it_reports_anything(env, monkeypatch):
+    """W-1025: the lifespan takes the queue beside the start, and the first
+    report (the start's own tick) waits for it, then acknowledges it."""
+    import time
+    from featherframe.app import app
+    door, link, data = env
+    door.state.ingest = [{"seq": 1, "path": "/api/hosted/seed", "body": json.dumps({"region": "europe"})}]
+    order = []
+    take_queue, report = link.take_queue, link.report
+    monkeypatch.setattr(link, "take_queue", lambda: (order.append("take"), take_queue())[1])
+    monkeypatch.setattr(link, "report", lambda state: (order.append("report"), report(state))[1])
+    monkeypatch.setattr(hosted, "config_from_env", lambda: ("http://door/h", "k"))
+    monkeypatch.setattr(hosted, "HostedLink", lambda *a: link)
+    monkeypatch.setattr(hosted, "QUEUE_WAIT_S", 5)       # a broken start fails, not hangs
+    with TestClient(app):
+        for _ in range(150):
+            if door.state.acked:
+                break
+            time.sleep(0.1)
+        assert link.queue_ready.is_set()
+    assert order[:2] == ["take", "report"] and door.state.acked == [1]
+
+
+# -- fix round: the queue is applied once, and a switch reaches the frames first (W-1025) --
+def test_two_takes_given_the_same_rows_apply_them_once(env, monkeypatch):
+    """A start's take and a run's take are both handed every row not yet
+    acknowledged; the second must read what the first applied, not what the
+    database held before it began."""
+    import threading
+    door, link, svc, tok = _queue_svc(env)
+    door.state.ingest = [{"seq": n, "path": f"/api/ingest/birdnet-go/{tok}",
+                          "body": _go("Blue Jay", "Cyanocitta cristata")} for n in (1, 2, 3)]
+    entered, release, calls = threading.Event(), threading.Event(), []
+    real = svc.source.ingest
+
+    def held(payload):
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(10)               # the first take, held inside a row
+        return real(payload)
+
+    monkeypatch.setattr(svc.source, "ingest", held)
+    first = threading.Thread(target=link.take, args=(svc,))
+    first.start()
+    assert entered.wait(10)
+    second = threading.Thread(target=link.take, args=(svc,))
+    second.start()
+    second.join(0.5)                              # it has the rows and waits for the lock
+    release.set()
+    first.join(10)
+    second.join(10)
+    assert len(svc.source.new_since(0)) == 3 and len(calls) == 3
+    assert svc.db.get("queue_seq") == 3 and link._ack_upto == 3
+
+
+def test_a_replayed_switch_reaches_the_frames_before_any_report(env):
+    """The take leaves each frame's output on the picture the marker made, so a
+    settle with no run after it does not put the frames back."""
+    door, link, svc, tok = _queue_svc(env)
+    svc.tick()
+    seed_frame(svc, shows="plates", etag="old")
+    before = svc.hosted_state()["frames"][FRAME_ID]
+    assert before["etag"] == "old"
+    door.state.ingest = [
+        {"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 2, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "cyanocitta cristata",
+                                                         "etag": None, "upto": 1})}]
+    link.take(svc)
+    pic = svc.pictures["plates"]
+    after = svc.hosted_state()["frames"][FRAME_ID]
+    assert after["etag"] != "old"
+    assert after["file"].startswith(f"frames/drawn/out/{pic.etag}-")
+    assert after["push"]["etag"] == after["etag"]
+
+
+def test_a_failing_frame_draw_after_the_queue_is_logged_not_raised(env, monkeypatch):
+    door, link, svc, tok = _queue_svc(env)
+    svc.tick()
+
+    def broken():
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(svc, "_tick_frames", broken)
+    door.state.ingest = [
+        {"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 2, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "cyanocitta cristata",
+                                                         "etag": None, "upto": 1})}]
+    link.take(svc)
+    assert svc.db.get("queue_seq") == 2 and link._ack_upto == 2
+
+
+def test_a_report_acknowledges_only_what_was_taken_before_its_state_was_built(env, monkeypatch):
+    """A take that ends while a settle builds its state (a run's take beside a
+    save's settle) is acknowledged by the next settle, not this one."""
+    door, link, svc, tok = _queue_svc(env)
+    door.state.ingest = [{"seq": 3, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+    link.take(svc)
+    real, once = svc.hosted_state, [True]
+
+    def state():
+        if once[0]:
+            once[0], link._ack_upto = False, 5     # a take ended after the settle began
+        return real()
+
+    monkeypatch.setattr(svc, "hosted_state", state)
+    link.settle(svc, False)
+    assert door.state.acked == [3] and link._ack_upto == 5
+    link.settle(svc, False)
+    assert door.state.acked == [3, 5] and link._ack_upto == 0
+
+
+# -- fix round 2: each report says how far through the queue it is (W-1025) --
+def test_a_report_says_how_far_through_the_queue_it_is(env):
+    door, link, svc, tok = _queue_svc(env)
+    assert svc.hosted_state()["applied_seq"] == 0
+    door.state.ingest = [
+        {"seq": 4, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 6, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "cyanocitta cristata",
+                                                         "etag": None, "upto": 4})}]
+    link.take(svc)
+    assert svc.hosted_state()["applied_seq"] == 6
+    link.take(svc)                                  # the same rows again: nothing moves
+    assert svc.hosted_state()["applied_seq"] == 6
+
+
+def test_a_fresh_service_reports_what_a_previous_process_applied(env):
+    first = _service()
+    first.db.set("queue_seq", 7)
+    assert _service().hosted_state()["applied_seq"] == 7
+
+
+def test_a_report_built_between_a_replay_and_the_frames_does_not_claim_it(env, monkeypatch):
+    """A save's settle beside a run's take can build its report after a
+    marker is replayed and before the frames follow it: it shows the seq before."""
+    import threading
+    from featherframe import service as service_mod
+    door, link, svc, tok = _queue_svc(env)
+    svc.tick()
+    seed_frame(svc, shows="plates", etag="old")
+    door.state.ingest = [{"seq": 1, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")}]
+    link.take(svc)
+    assert svc.hosted_state()["applied_seq"] == 1
+    door.state.ingest = [
+        {"seq": 2, "path": f"/api/ingest/birdnet-go/{tok}", "body": _go("Blue Jay", "Cyanocitta cristata")},
+        {"seq": 3, "path": "marker", "body": json.dumps({"at": NOW.isoformat(), "choice": "cyanocitta cristata",
+                                                         "etag": None, "upto": 2})}]
+    entered, release = threading.Event(), threading.Event()
+    frames = svc._tick_frames
+
+    def held():
+        entered.set()
+        assert release.wait(10)                     # the marker is replayed, the frames are not
+        frames()
+
+    monkeypatch.setattr(svc, "_tick_frames", held)
+    monkeypatch.setattr(service_mod, "SWITCH_LOCK_WAIT_S", 0.05)   # the report does not wait for the take
+    taker = threading.Thread(target=link.take, args=(svc,))
+    taker.start()
+    assert entered.wait(10)
+    assert svc.hosted_state()["applied_seq"] == 1
+    release.set()
+    taker.join(10)
+    assert svc.hosted_state()["applied_seq"] == 3
