@@ -1,0 +1,45 @@
+# My own illustrations: a folio of images kept on this Pi.
+#
+# fetch_plates.py reads this folder as well as scripts/folios/, copies each
+# image below from ../images/ into plates/img/mine/, and adds it to the plate
+# index. After editing this file or an image:
+#
+#     cd ~/featherframe/server
+#     ./.venv/bin/python scripts/fetch_plates.py
+#     sudo systemctl restart featherframe
+#
+# Check one without the frame:
+#     ./.venv/bin/python -m featherframe.preview --species "Northern Cardinal"
+#
+# Per species:
+#   common      the common name, as BirdNET-Pi stores it (Com_Name)
+#   scientific  the Latin name, as BirdNET-Pi stores it (Sci_Name); matched exactly
+#   plate       any positive number; shown as "Plate N" in the corner
+#   file        the image's file name in ../images/ (JPEG or PNG)
+#   composite   true when the image shows several birds: it is shown whole
+#   legend      optional lines printed under the name
+#   sci_synonyms  older Latin names BirdNET might report
+#   crop_box    optional [x, y, w, h] in 0..1, to place the crop by hand
+#   rotate      optional degrees (90, 180, 270) to stand a sideways image up
+#
+# List BirdNET-Pi's names with:
+#   sqlite3 -readonly ~/BirdNET-Pi/scripts/birds.db \
+#     "SELECT DISTINCT Sci_Name, Com_Name FROM detections ORDER BY Com_Name;"
+
+folio:
+  title: "My Backyard Plates"
+  artist: "Aaron"
+  years: "2026"
+  region: north-america
+  # Asked before every other folio, Audubon included. A species not listed
+  # here still gets its Audubon or Gould plate.
+  first: true
+  scans: "../images/{file}"
+  margins: [0, 0, 1, 1]   # keep the whole image (Audubon's trim cuts the lettering off a plate)
+  tight: true             # crop to the bird, with a white border
+  flatten: true           # even the paper out to pure white
+
+species:
+  # - {common: "Northern Cardinal", scientific: "Cardinalis cardinalis", plate: 1, file: cardinal.jpg}
+  # - {common: "Carolina Wren", scientific: "Thryothorus ludovicianus", plate: 2, file: wren.png,
+  #    legend: ["Male, on a yellow jessamine."]}

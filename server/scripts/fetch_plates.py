@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -59,6 +60,9 @@ RAW_BASE = os.environ.get(
 DATA_JSON_URL = f"{RAW_BASE}/data.json"
 AUDUBON_MEDIA = "https://media.audubon.org/boa_illustration"
 DEFAULT_FOLIOS_DIR = Path(__file__).resolve().parent / "folios"
+# The owner's own folios (images of their own, scanned or drawn), kept apart
+# from the published ones so an upstream folio never collides with them.
+LOCAL_FOLIOS_DIR = Path(__file__).resolve().parents[1] / "local" / "folios"
 HAVELL = "havell"
 DEFAULT_LEGENDS_YAML = Path(__file__).resolve().parent / "legends.yaml"
 USER_AGENT = "Featherframe/1.0 (+https://github.com; personal e-paper art frame)"
@@ -307,16 +311,30 @@ def _first_year(header: dict) -> int:
     return int(m.group()) if m else 9999
 
 
-def load_folios(folios_dir: Path) -> list[tuple[str, dict, list]]:
-    """(id, header, species) for every folio file, Havell's first, then the
-    rest as they were published (W-870: Europe 1832 before Australia 1840), so
-    a new folio never takes a species from one a household already sees: the
-    order the index lists them is the order a species' folios are asked in."""
+def is_local(source: str) -> bool:
+    """A `scans` template that names files on this machine, not a URL."""
+    return not str(source).startswith(("http://", "https://"))
+
+
+def load_folios(*folios_dirs: Path) -> list[tuple[str, dict, list]]:
+    """(id, header, species) for every folio file in the given directories,
+    Havell's first, then the rest as they were published (W-870: Europe 1832
+    before Australia 1840), so a new folio never takes a species from one a
+    household already sees: the order the index lists them is the order a
+    species' folios are asked in. A header's `first: true` puts its folio
+    ahead of all of them, Havell included: the owner's own images.
+
+    A local `scans` template is resolved against its folio file's directory."""
     out = []
-    for f in folios_dir.glob("*.yaml"):
-        doc = yaml.safe_load(f.read_text()) or {}
-        out.append((f.stem, dict(doc.get("folio") or {}), list(doc.get("species") or [])))
-    return sorted(out, key=lambda x: (x[0] != HAVELL, _first_year(x[1]), x[0]))
+    for folios_dir in folios_dirs:
+        for f in Path(folios_dir).glob("*.yaml"):
+            doc = yaml.safe_load(f.read_text()) or {}
+            header = dict(doc.get("folio") or {})
+            if header.get("scans") and is_local(header["scans"]):
+                header["scans"] = str((f.parent / Path(header["scans"]).expanduser()).resolve())
+            out.append((f.stem, header, list(doc.get("species") or [])))
+    return sorted(out, key=lambda x: (not x[1].get("first"), x[0] != HAVELL,
+                                      _first_year(x[1]), x[0]))
 
 
 def fetch_havell(session: requests.Session, species: list, args, images_dir: Path,
@@ -400,11 +418,24 @@ def fetch_havell(session: requests.Session, species: list, args, images_dir: Pat
     return records, counts, {"catalog": rows}
 
 
-def scan_filename(folio: str, entry: dict) -> str:
+def scan_filename(folio: str, entry: dict, tag: str = "") -> str:
     """Where a scanned folio keeps a sheet, under img/: one file per leaf of
     the book, shared by every species on it. Named by leaf, not plate number:
-    a copy's numbering can disagree with the list (Gould's 447/448)."""
-    return f"{folio}/{entry['volume']}-{int(entry['leaf']):04d}.jpg"
+    a copy's numbering can disagree with the list (Gould's 447/448). An entry
+    that names a `file` instead is kept under that file's stem. `tag` (a
+    local image's content hash) gives a changed image a new name, so a sheet
+    drawn from the old one is never reused for it."""
+    suffix = f"-{tag}" if tag else ""
+    if entry.get("volume") is None and entry.get("file"):
+        return f"{folio}/{Path(str(entry['file'])).stem}{suffix}.jpg"
+    return f"{folio}/{entry['volume']}-{int(entry['leaf']):04d}{suffix}.jpg"
+
+
+def scan_source(header: dict, entry: dict) -> str:
+    """The URL (or local path) of an entry's master, from its folio's
+    `scans` template: {volume}, {leaf} and {file} are filled from the entry."""
+    return header["scans"].format(volume=entry.get("volume"), leaf=int(entry.get("leaf") or 0),
+                                  file=entry.get("file", ""))
 
 
 def scan_margins(entry: dict, header: dict):
@@ -543,19 +574,27 @@ def fetch_scans(folio: str):
             if entry.get("plate") in (None, "none", False):
                 counts["fallback"] += 1
                 continue
-            name = scan_filename(folio, entry)
+            url = scan_source(header, entry)
+            local = is_local(url)
+            if local and not Path(url).is_file():
+                counts["failed"] += 1
+                print(f"  !  {common}: no image at {url}")
+                continue
+            tag = hashlib.sha256(Path(url).read_bytes()).hexdigest()[:8] if local else ""
+            name = scan_filename(folio, entry, tag)
             dest = images_dir / name
             if dest.exists() and dest.stat().st_size > 0 and not args.force:
                 record["image"] = name
                 counts["downloaded"] += 1
                 continue
-            url = header["scans"].format(volume=entry["volume"], leaf=int(entry["leaf"]))
             if args.dry_run:
                 print(f"  ·  {common}: plate {entry['plate']} (would download {url}, dry-run)")
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             raw = dest.with_name(dest.name + ".src")
-            if _fetch_to(session, url, raw):
+            if local:
+                shutil.copyfile(url, raw)
+            if local or _fetch_to(session, url, raw):
                 try:
                     flatten = entry.get("flatten", header.get("flatten", False))
                     store_scan(raw, dest, int(entry.get("rotate") or 0), bool(flatten))
@@ -564,7 +603,8 @@ def fetch_scans(folio: str):
                 record["image"] = name
                 counts["downloaded"] += 1
                 print(f"  ✓  {common}: plate {entry['plate']} -> {name}")
-                time.sleep(POLITE_PAUSE_S)
+                if not local:
+                    time.sleep(POLITE_PAUSE_S)
             elif from_release(session, header, entry, dest, manifests):
                 record["image"] = name
                 counts["downloaded"] += 1
@@ -600,7 +640,8 @@ def main() -> int:
                     help="skip the release tarballs; fetch plate by plate from the mirror")
     args = ap.parse_args()
 
-    folios = load_folios(args.folios)
+    dirs = [args.folios] + ([LOCAL_FOLIOS_DIR] if args.folios == DEFAULT_FOLIOS_DIR else [])
+    folios = load_folios(*dirs)
     if not any(species for _, _, species in folios):
         print(f"No species found in {args.folios}")
         return 1

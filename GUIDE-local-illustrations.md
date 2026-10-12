@@ -362,71 +362,73 @@ Edit `server/scripts/folios/havell.yaml`:
 > Note: `git pull` will conflict with your edits to `havell.yaml`. Your own
 > folio file (Level 3) avoids that.
 
-### Level 3: Your own folio of illustrations (any source)
+### Level 3: Your own illustrations (the `my-pi` branch)
 
-I tested this on a scratch copy of the repo. A new YAML file in
-`scripts/folios/` becomes a new folio, and every image goes through the same
-crop, caption, dither and collage path.
+The `my-pi` branch of your fork is set up for this. Your images go through the
+same crop, caption, dither and collage steps as Audubon's plates.
 
-**1. Write the folio.** For example, `server/scripts/folios/mine.yaml`:
+**What's on the branch:**
 
-```yaml
-folio:
-  title: "My Backyard Plates"
-  artist: "Your name, or the source's"
-  years: "2026"
-  region: north-america          # same as your Region → asked BEFORE Havell
-  scans: "http://localhost:8765/{volume}-{leaf}.jpg"   # required: it selects the generic fetcher
-  margins: [0, 0, 1, 1]          # keep the whole image (Havell's trim would cut 9 % off the bottom)
-  tight: true                    # crop to the art's own box, add a white border
-  flatten: true                  # on download: even the paper out to pure white
-species:
-  - {common: "Northern Cardinal", scientific: "Cardinalis cardinalis", plate: 1, volume: a, leaf: 1}
-  - {common: "Carolina Wren",     scientific: "Thryothorus ludovicianus", plate: 2, volume: a, leaf: 2,
-     legend: ["Male and female, on a yellow jessamine."]}
-```
+| Path | What it is |
+|---|---|
+| `server/local/folios/mine.yaml` | Your folio: one line per species, with every field explained at the top |
+| `server/local/images/` | Your image files |
+| `server/scripts/fetch_plates.py` | Also reads `server/local/folios/`, copies local images, and supports `first: true` |
 
-**2. Provide the images.** The fetcher stores each one at
-`plates/img/<folio>/<volume>-<leaf:04d>.jpg`, for example
-`plates/img/mine/a-0001.jpg`. You can do this two ways:
+**Adding a bird:**
 
-- **Serve them once over HTTP** (recommended), so `flatten` and `rotate` run:
-  ```bash
-  # your images named a-1.jpg, a-2.jpg … in ~/my-plates
-  cd ~/my-plates && python3 -m http.server 8765 &
-  cd ~/featherframe/server && ./.venv/bin/python scripts/fetch_plates.py
-  kill %1
-  ```
-- **Or copy them straight into place.** The fetcher skips any file that's
-  already there, so the `scans` URL is never used. Paper flattening is skipped
-  too, so give these images a **clean white background** or they'll render
-  with a light gray cast.
+1. Copy the image into `server/local/images/`, for example `cardinal.jpg`.
+2. Add a line under `species:` in `server/local/folios/mine.yaml`:
+   ```yaml
+   - {common: "Northern Cardinal", scientific: "Cardinalis cardinalis", plate: 1, file: cardinal.jpg}
+   ```
+3. Rebuild the index and restart the service:
+   ```bash
+   cd ~/featherframe/server
+   ./.venv/bin/python scripts/fetch_plates.py
+   sudo systemctl restart featherframe
+   ```
+4. Check it without the frame:
+   ```bash
+   ./.venv/bin/python -m featherframe.preview --species "Northern Cardinal"   # → ../test_output/
+   ```
 
-Then restart: `sudo systemctl restart featherframe`.
+**How the folio behaves:**
 
-**Rules that keep it working:**
+- **It's asked first.** `first: true` in the header puts your folio ahead of
+  Audubon and Gould. A species you list shows your image. A species you don't
+  list still gets its Audubon or Gould plate.
+- **The paper is evened out to white.** `flatten: true` runs on the copy, so a
+  cream or gray background doesn't show as a gray box on the panel.
+- **A changed image is redrawn.** The copy in `plates/img/mine/` is named by
+  the image's content, so after you replace `cardinal.jpg` and rerun
+  `fetch_plates.py`, the frame draws the new one instead of reusing the old
+  sheet.
+- **A missing image is reported.** `fetch_plates.py` prints
+  `no image at …` and the species falls through to Audubon.
+
+**Rules for each entry:**
 
 | Rule | Why |
 |---|---|
-| `plate` must be a positive number | `match()` reads `int(entry["plate"])`; `none` means "no plate". It also prints as "Plate I" in the corner. |
 | `scientific` must equal BirdNET's `Sci_Name` | Matching is exact. Add `sci_synonyms` for older names. |
-| Your folio's `region` decides priority | If it matches your Region, it's asked first and overrides Audubon. With a different region, it only fills species the books don't have. |
+| `plate` must be a positive number | `plate: none` means "no plate". The number prints as "Plate N" in the corner. |
 | One bird per image is best | For several birds, set `composite: true` and the image is shown whole. |
-| Portrait images, roughly 3:4 | They fill the sheet best. Landscape images are fitted with white space. |
+| Portrait images, roughly 3:4 | They fill the sheet best. Landscape images are fitted with white space, or use `rotate`. |
 | 2,000 px or more on the long side | The art is drawn up to 1404 px wide. |
-| Gray or colour both work | Gray panels use the luminance. The colour EE02 uses the RGB. |
+| Gray or color both work | Gray panels use the luminance. The color EE02 uses the RGB. |
 
 The left corner (artist) stays blank for your folio, because credits come from
-`featherframe/plate_credits.json`. The right corner shows "Plate N".
+`featherframe/plate_credits.json`.
 
 **Good public-domain sources for more plates:**
 
-- audubon.org's *Birds of America* (already used).
+- audubon.org's *Birds of America*.
 - The Biodiversity Heritage Library (Gould, Wilson's *American Ornithology*,
   Catesby).
 - The open dataset `github.com/wr/historical-bird-plates` (CC0).
 
-Check each image's licence.
+Check each image's license.
 
 ### Level 4: Mirror the sources yourself
 

@@ -298,3 +298,42 @@ def test_the_shipped_fix_is_the_dataset_release_sheet(fp):
     assert fix["url"].endswith("/havell-v2/sheet-165.jpg")
     assert fix["fileName"] != "plate-165-bachmans-finch.jpg"
     assert len(fix["sha256"]) == 64
+
+
+def test_a_local_folio_is_copied_from_its_own_folder(fp, tmp_path):
+    """A `scans` template that is a path, resolved against the folio file:
+    each image is copied (no session), stood upright, and named by its
+    content, so a changed image is a new file and never an old sheet."""
+    from PIL import Image
+    folios, images, out = tmp_path / "folios", tmp_path / "images", tmp_path / "img"
+    folios.mkdir(), images.mkdir()
+    (folios / "mine.yaml").write_text(
+        "folio: {title: Mine, years: '2026', scans: '../images/{file}', first: true}\n"
+        "species:\n"
+        "  - {common: Northern Cardinal, scientific: Cardinalis cardinalis, plate: 1,"
+        " file: cardinal.png, rotate: 90}\n"
+        "  - {common: Blue Jay, scientific: Cyanocitta cristata, plate: 2, file: missing.jpg}\n")
+    (images / "cardinal.png").write_bytes(_png_bytes((500, 300), "white"))
+    [(folio, header, species)] = fp.load_folios(folios)
+    assert header["scans"] == str(images.resolve() / "{file}")
+    args = type("A", (), {"force": False, "dry_run": False})()
+    records, counts, _ = fp.fetcher_for(folio, header)(None, species, args, out, {}, header)
+    assert counts == {"downloaded": 1, "fallback": 0, "failed": 1}
+    cardinal, jay = records
+    assert cardinal["image"].startswith("mine/cardinal-") and jay["image"] is None
+    assert Image.open(out / cardinal["image"]).size == (300, 500)
+    (images / "cardinal.png").write_bytes(_png_bytes((500, 300), "gray"))
+    again, _, _ = fp.fetcher_for(folio, header)(None, species[:1], args, out, {}, header)
+    assert again[0]["image"] != cardinal["image"]
+
+
+def test_a_first_folio_is_asked_before_havell(fp, tmp_path):
+    """`first: true` puts the owner's folio ahead of Havell in the index, so
+    it wins a species both have; the rest keep their order."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    (a / "havell.yaml").write_text("folio: {years: '1827'}\nspecies: []\n")
+    (a / "gould_europe.yaml").write_text("folio: {years: '1832'}\nspecies: []\n")
+    (b / "mine.yaml").write_text("folio: {years: '2026', first: true}\nspecies: []\n")
+    (b / "later.yaml").write_text("folio: {years: '2026'}\nspecies: []\n")
+    assert [f for f, _, _ in fp.load_folios(a, b)] == ["mine", "havell", "gould_europe", "later"]
