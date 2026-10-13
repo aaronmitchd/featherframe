@@ -35,6 +35,11 @@ folio:
   # here still gets its Audubon or Gould plate.
   first: true
   scans: "../images/{file}"
+  # Any image in ../images/ named for its species ("Cardinalis cardinalis.jpg")
+  # is added without a line below, numbered after the listed ones. List one
+  # below to give it a legend or other fields. scripts/missing_plates.py
+  # prints the name to give each species that still has no plate.
+  auto: true
   margins: [0, 0, 1, 1]   # keep the whole image (Audubon's trim cuts the lettering off a plate)
   tight: true             # crop to the bird, with a white border
   flatten: true           # even the paper out to pure white

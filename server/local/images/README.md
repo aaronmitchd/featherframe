@@ -1,6 +1,12 @@
 # My illustrations
 
-Put your bird images here, then list each one in `../folios/mine.yaml`.
+Put your bird images here, named for the species' scientific name as
+BirdNET-Pi stores it: `Cardinalis cardinalis.jpg`. Then run
+`scripts/fetch_plates.py` and restart the service. To see which species
+still need an image, run `scripts/missing_plates.py`.
+
+An image with any other name needs a line in `../folios/mine.yaml`, which
+is also where you add a legend or other fields.
 
 - One bird per image works best. For several birds, set `composite: true`.
 - Portrait, about 3:4, at least 2,000 px on the long side.

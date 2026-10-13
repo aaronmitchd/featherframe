@@ -373,22 +373,38 @@ same crop, caption, dither and collage steps as Audubon's plates.
 |---|---|
 | `server/local/folios/mine.yaml` | Your folio: one line per species, with every field explained at the top |
 | `server/local/images/` | Your image files |
-| `server/scripts/fetch_plates.py` | Also reads `server/local/folios/`, copies local images, and supports `first: true` |
+| `server/scripts/fetch_plates.py` | Also reads `server/local/folios/`, copies local images, and supports `first: true` and `auto: true` |
+| `server/scripts/missing_plates.py` | Lists every species your BirdNET-Pi has heard that has no plate yet |
+
+**Finding the species that need an image:**
+
+```bash
+cd ~/featherframe/server
+./.venv/bin/python scripts/missing_plates.py          # add --all to list every species and its plate
+```
+
+It reads BirdNET-Pi's database read-only and lists each species heard at 70 %
+confidence or more that has no plate in your Region, most heard first, with
+the file name to give its image.
 
 **Adding a bird:**
 
-1. Copy the image into `server/local/images/`, for example `cardinal.jpg`.
-2. Add a line under `species:` in `server/local/folios/mine.yaml`:
+1. Copy the image into `server/local/images/`, named for its scientific name
+   as BirdNET-Pi stores it: `Cardinalis cardinalis.jpg`. With `auto: true` in
+   the folio's header (it's on in `mine.yaml`), that's all it needs.
+   An image with another name needs a line under `species:` in
+   `server/local/folios/mine.yaml`, which is also where a legend goes:
    ```yaml
-   - {common: "Northern Cardinal", scientific: "Cardinalis cardinalis", plate: 1, file: cardinal.jpg}
+   - {common: "Northern Cardinal", scientific: "Cardinalis cardinalis", plate: 1, file: cardinal.jpg,
+      legend: ["Male, on a wild grape."]}
    ```
-3. Rebuild the index and restart the service:
+2. Rebuild the index and restart the service:
    ```bash
    cd ~/featherframe/server
    ./.venv/bin/python scripts/fetch_plates.py
    sudo systemctl restart featherframe
    ```
-4. Check it without the frame:
+3. Check it without the frame:
    ```bash
    ./.venv/bin/python -m featherframe.preview --species "Northern Cardinal"   # → ../test_output/
    ```
@@ -404,6 +420,9 @@ same crop, caption, dither and collage steps as Audubon's plates.
   the image's content, so after you replace `cardinal.jpg` and rerun
   `fetch_plates.py`, the frame draws the new one instead of reusing the old
   sheet.
+- **Images found by name are numbered after the listed ones**, in
+  alphabetical order. Adding a file can renumber the ones after it, and the
+  frame then redraws them once.
 - **A missing image is reported.** `fetch_plates.py` prints
   `no image at …` and the species falls through to Audubon.
 

@@ -337,3 +337,28 @@ def test_a_first_folio_is_asked_before_havell(fp, tmp_path):
     (b / "mine.yaml").write_text("folio: {years: '2026', first: true}\nspecies: []\n")
     (b / "later.yaml").write_text("folio: {years: '2026'}\nspecies: []\n")
     assert [f for f, _, _ in fp.load_folios(a, b)] == ["mine", "havell", "gould_europe", "later"]
+
+
+def test_an_auto_folio_takes_images_named_for_their_species(fp, tmp_path):
+    """`auto: true`: an image named for its species needs no entry. Listed
+    entries keep their numbers, the rest follow in name order, and a file an
+    entry already names, or a name that is no species, is not added."""
+    folios, images = tmp_path / "folios", tmp_path / "images"
+    folios.mkdir(), images.mkdir()
+    (folios / "mine.yaml").write_text(
+        "folio: {title: Mine, scans: '../images/{file}', auto: true}\n"
+        "species:\n"
+        "  - {common: Northern Cardinal, scientific: Cardinalis cardinalis, plate: 3, file: red.png}\n")
+    for name in ("red.png", "Cyanocitta_cristata.png", "Baeolophus bicolor.jpg",
+                 "Cardinalis cardinalis.png", "my bird.png", "README.md"):
+        (images / name).write_bytes(_png_bytes((300, 400), "white"))
+    [(folio, header, species)] = fp.load_folios(folios)
+    added = fp.auto_entries(header, species)
+    assert [(e["scientific"], e["file"], e["plate"]) for e in added] == [
+        ("Baeolophus bicolor", "Baeolophus bicolor.jpg", 4),
+        ("Cyanocitta cristata", "Cyanocitta_cristata.png", 5)]
+    assert fp.auto_entries({**header, "auto": False}, species) == []
+    args = type("A", (), {"force": False, "dry_run": False})()
+    records, counts, _ = fp.fetcher_for(folio, header)(None, species, args, tmp_path / "img", {}, header)
+    assert counts["downloaded"] == 3 and counts["failed"] == 0
+    assert records[2]["image"].startswith("mine/Cyanocitta_cristata-")

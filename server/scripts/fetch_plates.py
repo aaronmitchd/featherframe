@@ -438,6 +438,47 @@ def scan_source(header: dict, entry: dict) -> str:
                                   file=entry.get("file", ""))
 
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+# A file named for its species: "Cardinalis cardinalis.jpg", underscores allowed.
+BINOMIAL_RE = re.compile(r"^[A-Z][a-z]+ [a-z-]+( [a-z-]+)?$")
+
+
+def binomial_of(path: Path) -> str | None:
+    """The scientific name an image file is named for, or None."""
+    name = " ".join(path.stem.replace("_", " ").split())
+    return name if BINOMIAL_RE.match(name) else None
+
+
+def auto_entries(header: dict, species: list) -> list[dict]:
+    """With `auto: true`, an entry for every image in the folio's local
+    folder named for its species and not already named by an entry's `file`
+    or `scientific`. Their plate numbers follow the listed ones, in name
+    order, so adding a file may renumber (and so redraw) the ones after it."""
+    template = str(header.get("scans") or "")
+    if not header.get("auto") or not is_local(template) or not template.endswith("{file}"):
+        return []
+    folder = Path(template[:-len("{file}")])
+    if not folder.is_dir():
+        return []
+    files = {str(e.get("file")) for e in species if e.get("file")}
+    names = {str(e.get("scientific", "")).lower() for e in species}
+    plate = max((e["plate"] for e in species if isinstance(e.get("plate"), int)), default=0)
+    out = []
+    for f in sorted(folder.iterdir()):
+        sci = binomial_of(f)
+        if f.suffix.lower() not in IMAGE_SUFFIXES or f.name in files:
+            continue
+        if sci is None:
+            print(f"  ·  {f.name}: not named for a species (e.g. \"Cardinalis cardinalis.jpg\"); skipped")
+            continue
+        if sci.lower() in names:
+            continue
+        names.add(sci.lower())
+        plate += 1
+        out.append({"common": "", "scientific": sci, "file": f.name, "plate": plate})
+    return out
+
+
 def scan_margins(entry: dict, header: dict):
     """The part of an upright sheet kept before the crop: the plate's own
     `margins`, else its volume's (`volume_margins`, keyed by the entry's
@@ -550,6 +591,7 @@ def fetch_scans(folio: str):
         counts = {"downloaded": 0, "fallback": 0, "failed": 0}
         records = []
         manifests: dict = {}
+        species = list(species) + auto_entries(header, species)
         for entry in species:
             common = entry.get("common", "?")
             record = {
