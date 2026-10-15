@@ -1,0 +1,4 @@
+# The Inky Impression client (scripts/inky_frame.py), on a Pi with the panel
+# on its pins. scripts/install_inky.sh installs these into the server's venv.
+# 2.2 is the first release that handles the 13.3" Spectra 6 palette.
+inky>=2.2

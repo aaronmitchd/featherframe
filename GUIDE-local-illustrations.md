@@ -484,6 +484,32 @@ and the cloud container.
 
 ---
 
+## 6b. Showing it on an Inky Impression wired to the Pi
+
+`server/scripts/inky_frame.py` shows Featherframe on a Pimoroni Inky
+Impression on the Pi's pins (tested in dry-run; the 13.3" is the target).
+It joins Featherframe like a tablet on the kiosk page: it appears in the
+webapp's Frames list as asking to connect, shows a short id until you add it,
+then shows the picture you choose on its row (individual detections or the
+collage) and repaints only when that picture changes.
+
+```bash
+cd ~/featherframe/server
+./scripts/install_inky.sh                 # add --orientation landscape if it hangs that way
+sudo reboot                               # the first time: turns on the panel's pins
+```
+
+`install_inky.sh` turns on I2C and SPI, adds `dtoverlay=spi0-0cs` (and the
+I2C overlays) to `/boot/firmware/config.txt`, adds you to the `spi`, `i2c`
+and `gpio` groups, installs Pimoroni's `inky` library into the server's venv
+and installs the `featherframe-inky` service. Then:
+
+- Watch it: `journalctl -u featherframe-inky -f`
+- Add it in the webapp's **Frames** card (it's named `INKY-<hostname>`).
+- Upside down? Run `./scripts/install_inky.sh --turn 270` (portrait) or
+  `--orientation landscape --flip`.
+- Test without the panel: `./.venv/bin/python scripts/inky_frame.py --dry-run out.png`
+
 ## 7. Things to watch for
 
 - **The service caches the index.** After any `fetch_plates.py` run, restart
