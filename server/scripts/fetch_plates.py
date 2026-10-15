@@ -23,6 +23,7 @@ Usage:
     python scripts/fetch_plates.py --force        # re-download even if present
     python scripts/fetch_plates.py --all          # also cache every plate in the catalog (~2.9 GB)
     python scripts/fetch_plates.py --no-release   # skip the release tarballs, mirror only
+    python scripts/fetch_plates.py --skip 'gould_*'   # leave folios out (or FEATHERFRAME_SKIP_FOLIOS)
 
 `--all` caches the whole Havell edition, not just the curated species, so adding
 a species to folios/havell.yaml later is an index rewrite with no network, and every
@@ -36,6 +37,7 @@ the one to preserve when displaying its plates.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -335,6 +337,17 @@ def load_folios(*folios_dirs: Path) -> list[tuple[str, dict, list]]:
             out.append((f.stem, header, list(doc.get("species") or [])))
     return sorted(out, key=lambda x: (not x[1].get("first"), x[0] != HAVELL,
                                       _first_year(x[1]), x[0]))
+
+
+def skip_folios(folios: list, skip: str) -> list:
+    """`folios` without those whose id matches a pattern in `skip` (comma-
+    separated, wildcards allowed). A skipped folio is not in the index, so
+    its species fall through to the next folio, or to the fallback."""
+    patterns = [p.strip() for p in (skip or "").split(",") if p.strip()]
+    kept = [f for f in folios if not any(fnmatch.fnmatch(f[0], p) for p in patterns)]
+    for name in sorted({f[0] for f in folios} - {f[0] for f in kept}):
+        print(f"  ·  {name}: skipped")
+    return kept
 
 
 def fetch_havell(session: requests.Session, species: list, args, images_dir: Path,
@@ -680,10 +693,13 @@ def main() -> int:
                     help="also cache every Havell plate, not just the curated species (~2.9 GB)")
     ap.add_argument("--no-release", action="store_true",
                     help="skip the release tarballs; fetch plate by plate from the mirror")
+    ap.add_argument("--skip", default=os.environ.get("FEATHERFRAME_SKIP_FOLIOS", ""),
+                    help="comma-separated folio ids to leave out, wildcards allowed "
+                         "(e.g. 'gould_*'); default: FEATHERFRAME_SKIP_FOLIOS")
     args = ap.parse_args()
 
     dirs = [args.folios] + ([LOCAL_FOLIOS_DIR] if args.folios == DEFAULT_FOLIOS_DIR else [])
-    folios = load_folios(*dirs)
+    folios = skip_folios(load_folios(*dirs), args.skip)
     if not any(species for _, _, species in folios):
         print(f"No species found in {args.folios}")
         return 1

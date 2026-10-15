@@ -362,3 +362,10 @@ def test_an_auto_folio_takes_images_named_for_their_species(fp, tmp_path):
     records, counts, _ = fp.fetcher_for(folio, header)(None, species, args, tmp_path / "img", {}, header)
     assert counts["downloaded"] == 3 and counts["failed"] == 0
     assert records[2]["image"].startswith("mine/Cyanocitta_cristata-")
+
+
+def test_skip_leaves_folios_out_by_name_or_pattern(fp):
+    folios = [(n, {}, []) for n in ("mine", "havell", "gould_europe", "gould_asia")]
+    assert [f[0] for f in fp.skip_folios(folios, "gould_*")] == ["mine", "havell"]
+    assert [f[0] for f in fp.skip_folios(folios, " gould_asia , mine")] == ["havell", "gould_europe"]
+    assert fp.skip_folios(folios, "") == folios

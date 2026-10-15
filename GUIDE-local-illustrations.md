@@ -145,6 +145,7 @@ python scripts/fetch_plates.py --dry-run     # resolve, download nothing
 python scripts/fetch_plates.py --all         # cache EVERY Havell plate (~2.9 GB), not just the pinned species
 python scripts/fetch_plates.py --no-release  # skip the GitHub tarballs
 python scripts/fetch_plates.py --folios DIR  # use a different folio directory
+python scripts/fetch_plates.py --skip 'gould_*'   # leave folios out; FEATHERFRAME_SKIP_FOLIOS sets it for every run
 ```
 
 If you leave an entry's `plate:` out, `fetch_plates` uses `names.fuzzy_resolve_plate`
